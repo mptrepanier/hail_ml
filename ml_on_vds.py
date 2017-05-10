@@ -1,6 +1,7 @@
 # gcloud dataproc jobs submit pyspark ml_on_vds.py --cluster cow --files gs://bucket_pal/hail/build/libs/hail-all-spark.jar --py-files gs://bucket_pal/hail/python/pyhail.zip --properties=spark.driver.extraClassPath=./hail-all-spark.jar,spark.executor.extraClassPath=./hail-all-spark.jar
 
 from pyspark.sql import SparkSession
+from pyspark import SparkConf, SparkContext
 from pyspark.sql.functions import udf, hash, broadcast
 from pyspark.sql.types import *
 from pyspark.ml.clustering import KMeans
@@ -10,27 +11,20 @@ from pyspark.ml.feature import StringIndexer, PCA
 from hail import *
 
 def quality_control(vds):
-	# Filter on allelic balance.
-	filter_condition_ab = '''let ab = g.ad[1] / g.ad.sum() in
-	                         ((g.isHomRef() && ab <= 0.1) ||
-	                          (g.isHet() && ab >= 0.25 && ab <= 0.75) ||
-	                          (g.isHomVar() && ab >= 0.9))'''
 
-	# Filter out variants with low call rates.
-	vds_gAB = vds.filter_genotypes(filter_condition_ab)
-	vds_gAB_vCR = (vds_gAB
-				   .filter_variants_expr('gs.fraction(g => g.isCalled()) > 0.95')
-				   .sample_qc())
 
-	return vds_gAB_vCR
+	qc_vds = (vds.ld_prune(memory_per_core=13312, num_cores=8)
+			  .variant_qc()
+			  .filter_variants_expr("va.qc.AF > 0.4"))
+
+	qc_vds = qc_vds.repartition(96, False)
+	return qc_vds
 
 def vds_to_dataframe(vds):
 
-	#vds = quality_control(vds) # Comment out for non-sample.
-	vds = vds.filter_samples_expr('sa.pheno.Population == "GBR" || sa.pheno.Population == "PJL" || sa.pheno.Population == "ASW"')
-	gkt = vds.genotypes_keytable()
+	qc_vds = quality_control(vds)
+	gkt = qc_vds.genotypes_keytable()
 	gdf = gkt.to_dataframe()
-
 	sample_variant_call_df = (gdf.select(gdf['s'].alias('samples'),
 										 hash(gdf['`v.contig`'],gdf['`v.start`']).alias('variant_hash'),
 										 gdf['`g.gt`'].alias('call')).dropna())
@@ -43,12 +37,16 @@ def generate_feature_dataframe(df, spark):
 	indexer = StringIndexer(inputCol="variant_hash", outputCol="index")
 	indexed_df = indexer.fit(df).transform(df)
 	max_index = indexed_df.agg({"index": "max"}).collect()[0].asDict()['max(index)'] + 1
-	bmax_index = spark.sparkContext.broadcast(max_index)
-	vector_rdd = (indexed_df.rdd.map(lambda r: (r[0], [(r[3], r[2])]))
-				   .reduceByKey(lambda a,b: a+b)
-				   .mapValues(lambda l: Vectors.sparse(bmax_index.value, list(l))))
+	bmax_index = spark.sparkContext.broadcast(max_index + 1)
+	# vector_rdd = (indexed_df.rdd.map(lambda r: (r[0], [(r[3], r[2])]))
+	# 			   .reduceByKey(lambda a,b: a+b)
+	# 			   .mapValues(lambda l: Vectors.sparse(bmax_index.value, list(l))))
 
-	vector_df = vector_rdd.toDF(['sample', 'features'])
+	vector_rdd = (indexed_df.rdd.map(lambda r: (r[0], (r[3], r[2])))
+				  .groupByKey()
+				  .mapValues(lambda l: Vectors.sparse((bmax_index.value), list(l))))
+
+	vector_df = vector_rdd.toDF(['samples', 'features'])
 	return vector_df
 
 def get_population_mapping_df(vds):
@@ -66,17 +64,26 @@ def build_ml_pipeline():
 
 if __name__=="__main__":
 
-	# Initialize the HailContext.
-	hc = HailContext()
+	# Initialize the SparkContext/HailContext.
+	conf = (SparkConf().setAppName("Population Genomics")
+			.set("spark.sql.files.openCostInBytes", "1099511627776")
+			.set("spark.sql.files.maxPartitionBytes", "1099511627776")
+			.set("spark.kryoserializer.buffer.max", "1024")
+			.set("spark.hadoop.io.compression.codecs",
+				 "org.apache.hadoop.io.compress.DefaultCodec,is.hail.io.compress.BGzipCodec,org.apache.hadoop.io.compress.GzipCodec"))
+
+	sc = SparkContext(conf=conf)
+	hc = HailContext(sc)
 
 	# Read in the Variant DataSet
 	src_bucket = "gs://bucket_pal/"
 
 	#vds_path = "1000Genome/vds/sample.vds"
-	vds_path = vds_path = "/1000Genome/vds/phase3_split/ALL.chr9.phase3_shapeit2_mvncall_integrated_v2.20130502.genotypes.vds"
+	vds_path = vds_path = "/1000Genome/vds/phase3_split/ALL.chr9.phase3_shapeit2_mvncall_integrated_v2.20130502.genotypes.pop_filtered.vds"
 
 	print "\nReading in VDS."
 	vds = hc.read(src_bucket + vds_path)
+
 
 	# Build a SparkSession on top of the existing HailContext.
 	spark = SparkSession(vds.hc.sc)
